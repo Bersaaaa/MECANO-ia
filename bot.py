@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import logging
+import asyncio
 import anthropic
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -18,10 +19,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN manquant dans les variables d'environnement")
+if not ANTHROPIC_API_KEY:
+    raise ValueError("❌ ANTHROPIC_API_KEY manquant dans les variables d'environnement")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Teste la connexion à l'API au démarrage
+try:
+    test = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=10,
+        messages=[{"role": "user", "content": "ok"}],
+    )
+    logger.info("✅ Connexion Anthropic OK")
+except Exception as e:
+    logger.error(f"❌ Erreur connexion Anthropic: {e}")
+    raise
 
 SYSTEM_PROMPT = """Tu es AutoDoc, un expert en diagnostic automobile. Tu analyses des photos de voitures, codes défaut OBD, et descriptions de problèmes mécaniques.
 
@@ -90,6 +108,17 @@ def format_response(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _call_claude(content) -> str:
+    """Appel synchrone à Claude (exécuté dans un thread séparé)."""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
+    return response.content[0].text.strip()
+
+
 async def analyze_with_claude(text: str = None, image_bytes: bytes = None) -> str:
     try:
         if image_bytes:
@@ -111,23 +140,25 @@ async def analyze_with_claude(text: str = None, image_bytes: bytes = None) -> st
         else:
             content = text
 
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": content}],
-        )
+        # Exécute l'appel bloquant dans un thread pour ne pas bloquer asyncio
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, _call_claude, content)
 
-        raw = response.content[0].text.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
         return format_response(data)
 
-    except json.JSONDecodeError:
-        return "❌ Erreur lors de l'analyse. Réessaie avec plus de détails."
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e} | raw={raw[:200] if 'raw' in dir() else 'N/A'}")
+        return "❌ Réponse inattendue du modèle. Réessaie en donnant plus de détails."
+    except anthropic.AuthenticationError:
+        logger.error("Clé API Anthropic invalide !")
+        return "❌ Erreur d'authentification API. Vérifie la clé ANTHROPIC_API_KEY dans Railway."
+    except anthropic.RateLimitError:
+        return "⏳ Trop de requêtes. Attends quelques secondes et réessaie."
     except Exception as e:
-        logger.error(f"Erreur Claude: {e}")
-        return "❌ Une erreur est survenue. Réessaie dans quelques instants."
+        logger.error(f"Erreur Claude: {type(e).__name__}: {e}")
+        return f"❌ Erreur : {type(e).__name__}. Consulte les logs Railway pour plus de détails."
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -170,8 +201,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
         return
 
-    await update.message.reply_text("🔍 Analyse en cours...")
-    thinking_msg = await update.message.reply_text("⏳ Diagnostic en cours, veuillez patienter...")
+    thinking_msg = await update.message.reply_text("🔍 Analyse en cours, veuillez patienter...")
 
     result = await analyze_with_claude(text=text)
 
